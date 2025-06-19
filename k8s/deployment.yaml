@@ -1,0 +1,183 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: epictetus
+  namespace: epictetus
+  labels:
+    app: epictetus
+    version: v1.0.0
+spec:
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: epictetus
+  template:
+    metadata:
+      labels:
+        app: epictetus
+        version: v1.0.0
+    spec:
+      serviceAccountName: epictetus
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      containers:
+      - name: epictetus
+        image: epictetus:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8080
+          name: health
+          protocol: TCP
+        env:
+        - name: LOG_LEVEL
+          value: "INFO"
+        - name: LOG_FORMAT
+          value: "json"
+        - name: DNS_SYNC_INTERVAL
+          value: "60"
+        - name: HEALTH_CHECK_INTERVAL
+          value: "30"
+        - name: ENABLE_HEALTH_SERVER
+          value: "true"
+        - name: HEALTH_PORT
+          value: "8080"
+        - name: CLOUDFLARE_API_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: epictetus-secrets
+              key: cloudflare-api-token
+        - name: CLOUDFLARE_ZONE_ID
+          valueFrom:
+            secretKeyRef:
+              name: epictetus-secrets
+              key: cloudflare-zone-id
+        - name: DNS_HOSTNAMES
+          valueFrom:
+            configMapKeyRef:
+              name: epictetus-config
+              key: dns-hostnames
+        - name: SECRET_KEY
+          valueFrom:
+            secretKeyRef:
+              name: epictetus-secrets
+              key: secret-key
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "50m"
+          limits:
+            memory: "256Mi"
+            cpu: "200m"
+        livenessProbe:
+          httpGet:
+            path: /health/live
+            port: health
+          initialDelaySeconds: 30
+          periodSeconds: 30
+          timeoutSeconds: 10
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /health/ready
+            port: health
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        startupProbe:
+          httpGet:
+            path: /health
+            port: health
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 10
+        volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+      volumes:
+      - name: tmp
+        emptyDir: {}
+      nodeSelector:
+        kubernetes.io/os: linux
+      tolerations:
+      - key: "node-role.kubernetes.io/master"
+        operator: "Exists"
+        effect: "NoSchedule"
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values:
+                  - epictetus
+              topologyKey: kubernetes.io/hostname
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: epictetus
+  namespace: epictetus
+  labels:
+    app: epictetus
+spec:
+  type: ClusterIP
+  ports:
+  - port: 8080
+    targetPort: health
+    protocol: TCP
+    name: health
+  selector:
+    app: epictetus
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: epictetus
+  namespace: epictetus
+  labels:
+    app: epictetus
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: epictetus
+  labels:
+    app: epictetus
+rules:
+- apiGroups: [""]
+  resources: ["nodes"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: [""]
+  resources: ["services"]
+  verbs: ["get", "list", "watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: epictetus
+  labels:
+    app: epictetus
+subjects:
+- kind: ServiceAccount
+  name: epictetus
+  namespace: epictetus
+roleRef:
+  kind: ClusterRole
+  name: epictetus
+  apiGroup: rbac.authorization.k8s.io 

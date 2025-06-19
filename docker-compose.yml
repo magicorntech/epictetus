@@ -1,0 +1,32 @@
+version: '3.8'
+
+services:
+  epictetus:
+    build: .
+    environment:
+      - LOG_LEVEL=INFO
+      - LOG_FORMAT=console
+      - DNS_SYNC_INTERVAL=60
+      - HEALTH_CHECK_INTERVAL=30
+      - ENABLE_HEALTH_SERVER=true
+      - HEALTH_PORT=8080
+      # TODO: Set these in your .env file
+      - CLOUDFLARE_API_TOKEN=${CLOUDFLARE_API_TOKEN}
+      - CLOUDFLARE_ZONE_ID=${CLOUDFLARE_ZONE_ID}
+      - DNS_HOSTNAMES=${DNS_HOSTNAMES}
+    volumes:
+      # Mount kubeconfig for local development (optional)
+      - ~/.kube/config:/home/app/.kube/config:ro
+    ports:
+      - "8080:8080"  # Health check endpoint
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+networks:
+  default:
+    name: epictetus-network 
