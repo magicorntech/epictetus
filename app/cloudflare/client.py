@@ -99,6 +99,13 @@ class CloudFlareClient:
             )
             
             dns_records = []
+            # Get zone name from cache
+            zone_name = None
+            for cached_zone_name, cached_zone_id in self.zones_cache.items():
+                if cached_zone_id == zone_id:
+                    zone_name = cached_zone_name
+                    break
+            
             for record in records:
                 dns_record = DNSRecord(
                     id=record['id'],
@@ -107,8 +114,8 @@ class CloudFlareClient:
                     content=record['content'],
                     ttl=record['ttl'],
                     proxied=record['proxied'],
-                    zone_id=record['zone_id'],
-                    zone_name=record['zone_name'],
+                    zone_id=zone_id,  # Use the zone_id we already have
+                    zone_name=zone_name or 'unknown',  # Use cached zone name
                     created_on=datetime.fromisoformat(record['created_on'].replace('Z', '+00:00')),
                     modified_on=datetime.fromisoformat(record['modified_on'].replace('Z', '+00:00'))
                 )
@@ -146,6 +153,13 @@ class CloudFlareClient:
             
             result = self.cf.zones.dns_records.post(zone_id, data=data)
             
+            # Get zone name from cache
+            zone_name = None
+            for cached_zone_name, cached_zone_id in self.zones_cache.items():
+                if cached_zone_id == zone_id:
+                    zone_name = cached_zone_name
+                    break
+            
             dns_record = DNSRecord(
                 id=result['id'],
                 name=result['name'],
@@ -153,8 +167,8 @@ class CloudFlareClient:
                 type=result['type'],
                 ttl=result['ttl'],
                 proxied=result['proxied'],
-                zone_id=result['zone_id'],
-                zone_name=result['zone_name'],
+                zone_id=zone_id,  # Use the zone_id we already have
+                zone_name=zone_name or 'unknown',  # Use cached zone name
                 created_on=datetime.fromisoformat(result['created_on'].replace('Z', '+00:00')),
                 modified_on=datetime.fromisoformat(result['modified_on'].replace('Z', '+00:00'))
             )
@@ -336,18 +350,18 @@ class CloudFlareClient:
     def health_check(self) -> Dict[str, any]:
         """Perform health check on CloudFlare connectivity."""
         try:
-            # Try to refresh zones cache
+            # Try to refresh zones cache - this tests the core functionality we need
             self._refresh_zones_cache()
             
-            # Try to get user info
-            user_info = self.cf.user.get()
+            # Check if we have zones available
+            if not self.zones_cache:
+                raise Exception("No zones available or accessible")
             
             return {
                 'status': 'healthy',
                 'api_accessible': True,
                 'available_zones': len(self.zones_cache),
-                'zones': list(self.zones_cache.keys()),
-                'user_email': user_info.get('email', 'unknown')
+                'zones': list(self.zones_cache.keys())
             }
         except Exception as e:
             return {
