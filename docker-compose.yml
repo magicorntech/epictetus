@@ -10,10 +10,11 @@ services:
       - HEALTH_CHECK_INTERVAL=30
       - ENABLE_HEALTH_SERVER=true
       - HEALTH_PORT=8080
-      # TODO: Set these in your .env file
+      # Required: Set this in your .env file
       - CLOUDFLARE_API_TOKEN=${CLOUDFLARE_API_TOKEN}
-      - CLOUDFLARE_ZONE_ID=${CLOUDFLARE_ZONE_ID}
-      - DNS_HOSTNAMES=${DNS_HOSTNAMES}
+      # Note: CLOUDFLARE_ZONE_ID is no longer needed - zones are auto-detected
+      # Note: DNS hostnames are now configured via service annotations
+      # No need to set DNS_HOSTNAMES environment variable
     volumes:
       # Mount kubeconfig for local development (optional)
       - ~/.kube/config:/home/app/.kube/config:ro

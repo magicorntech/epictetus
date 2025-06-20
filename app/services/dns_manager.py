@@ -8,7 +8,7 @@ import time
 from app.logger import get_logger
 from app.models import (
     NodeInfo, DNSRecord, DNSManagementEvent, 
-    SyncReport, HealthStatus
+    SyncReport, HealthStatus, ServiceDNSConfig
 )
 from app.k8s.client import KubernetesClient
 from app.cloudflare.client import CloudFlareClient
@@ -18,31 +18,34 @@ logger = get_logger(__name__)
 
 
 class DNSManager:
-    """Core service for managing DNS records based on Kubernetes node lifecycle."""
+    """Core service for managing DNS records based on Kubernetes node lifecycle and service annotations."""
     
     def __init__(self, k8s_client: KubernetesClient, cf_client: CloudFlareClient, config):
         """Initialize DNS manager with clients and configuration."""
         self.k8s_client = k8s_client
         self.cf_client = cf_client
         self.config = config
-        self.hostnames = config.get('DNS_HOSTNAMES', [])
         
         # State tracking
         self.last_sync_time = None
         self.sync_reports = []
         self.events = []
+        self.service_configs_cache = []
         
         # Register for node events
         self.k8s_client.register_event_callback(self._handle_node_event)
         
-        logger.info("DNS Manager initialized", 
-                   hostnames=self.hostnames, 
-                   deletion_taints=config.get('DELETION_TAINTS', []),
-                   requires_all_taints=True)
+        logger.info("DNS Manager initialized (annotation-based)", 
+                   requires_all_taints=True,
+                   deletion_taints=config.get('DELETION_TAINTS', []))
     
     def start(self):
         """Start the DNS manager by beginning Kubernetes event watching."""
         try:
+            # Load initial service configurations
+            self._refresh_service_configs()
+            
+            # Start watching for node events
             self.k8s_client.start_watching()
             logger.info("DNS Manager started - watching for node events")
         except Exception as e:
@@ -56,6 +59,33 @@ class DNSManager:
             logger.info("DNS Manager stopped")
         except Exception as e:
             logger.error("Error stopping DNS Manager", error=str(e))
+    
+    def _refresh_service_configs(self):
+        """Refresh service DNS configurations from Kubernetes annotations."""
+        try:
+            new_configs = self.k8s_client.get_services_with_dns_annotations()
+            
+            # Log changes
+            old_count = len(self.service_configs_cache)
+            new_count = len(new_configs)
+            
+            if old_count != new_count:
+                logger.info("Service DNS configurations changed", 
+                           old_count=old_count, new_count=new_count)
+            
+            # Log service details
+            for config in new_configs:
+                logger.debug("Active DNS config", 
+                           service=f"{config.service_namespace}/{config.service_name}",
+                           hostname=config.hostname,
+                           ttl=config.ttl,
+                           proxied=config.proxied)
+            
+            self.service_configs_cache = new_configs
+            
+        except Exception as e:
+            logger.error("Failed to refresh service configurations", error=str(e))
+            # Keep existing configs on error
     
     def _handle_node_event(self, event_type: str, node_info: NodeInfo):
         """Handle Kubernetes node events and update DNS accordingly."""
@@ -104,16 +134,22 @@ class DNSManager:
                        taint_keys=[t.key for t in node_info.deletion_taints])
             return
         
-        # Add DNS records for the new node
+        # Refresh service configs in case they changed
+        self._refresh_service_configs()
+        
+        # Add DNS records for the new node based on service configurations
         dns_records = []
-        for hostname in self.hostnames:
+        for service_config in self.service_configs_cache:
             try:
-                record = self.cf_client.add_dns_record_for_new_node(hostname, node_info.external_ip)
+                record = self.cf_client.create_dns_record_from_service_config(
+                    service_config, node_info.external_ip
+                )
                 if record:
                     dns_records.append(record)
             except Exception as e:
                 logger.error("Failed to add DNS record for new node", 
-                           hostname=hostname, 
+                           service=f"{service_config.service_namespace}/{service_config.service_name}",
+                           hostname=service_config.hostname,
                            node_name=node_info.name, 
                            error=str(e))
         
@@ -122,9 +158,10 @@ class DNSManager:
             event_type="node_added",
             node_name=node_info.name,
             node_ip=node_info.external_ip,
+            service_configs=self.service_configs_cache.copy(),
             dns_records=dns_records,
             success=True,
-            metadata={"hostname_count": len(self.hostnames), "records_created": len(dns_records)}
+            metadata={"service_configs_count": len(self.service_configs_cache), "records_created": len(dns_records)}
         )
     
     def _handle_node_modified(self, event_id: str, node_info: NodeInfo):
@@ -138,14 +175,20 @@ class DNSManager:
                        node_name=node_info.name,
                        taint_keys=[t.key for t in node_info.deletion_taints])
             
+            # Refresh service configs
+            self._refresh_service_configs()
+            
             deleted_records = []
-            for hostname in self.hostnames:
+            for service_config in self.service_configs_cache:
                 try:
-                    deleted = self.cf_client.delete_dns_records_by_ip(hostname, node_info.external_ip)
+                    deleted = self.cf_client.delete_dns_records_by_ip(
+                        service_config.hostname, node_info.external_ip
+                    )
                     deleted_records.extend(deleted)
                 except Exception as e:
                     logger.error("Failed to delete DNS records for modified node", 
-                               hostname=hostname, 
+                               service=f"{service_config.service_namespace}/{service_config.service_name}",
+                               hostname=service_config.hostname,
                                node_name=node_info.name, 
                                error=str(e))
             
@@ -154,6 +197,7 @@ class DNSManager:
                 event_type="node_modified_all_deletion_taints",
                 node_name=node_info.name,
                 node_ip=node_info.external_ip,
+                service_configs=self.service_configs_cache.copy(),
                 success=True,
                 metadata={"records_deleted": len(deleted_records), "deleted_record_ids": deleted_records}
             )
@@ -163,15 +207,21 @@ class DNSManager:
         if not node_info.external_ip:
             return
         
+        # Refresh service configs
+        self._refresh_service_configs()
+        
         # Remove all DNS records for this node's IP
         deleted_records = []
-        for hostname in self.hostnames:
+        for service_config in self.service_configs_cache:
             try:
-                deleted = self.cf_client.delete_dns_records_by_ip(hostname, node_info.external_ip)
+                deleted = self.cf_client.delete_dns_records_by_ip(
+                    service_config.hostname, node_info.external_ip
+                )
                 deleted_records.extend(deleted)
             except Exception as e:
                 logger.error("Failed to delete DNS records for deleted node", 
-                           hostname=hostname, 
+                           service=f"{service_config.service_namespace}/{service_config.service_name}",
+                           hostname=service_config.hostname,
                            node_name=node_info.name, 
                            error=str(e))
         
@@ -180,6 +230,7 @@ class DNSManager:
             event_type="node_deleted",
             node_name=node_info.name,
             node_ip=node_info.external_ip,
+            service_configs=self.service_configs_cache.copy(),
             success=True,
             metadata={"records_deleted": len(deleted_records), "deleted_record_ids": deleted_records}
         )
@@ -192,6 +243,9 @@ class DNSManager:
         logger.info("Starting full DNS synchronization")
         
         try:
+            # Refresh service configurations
+            self._refresh_service_configs()
+            
             # Get all current nodes
             all_nodes = self.k8s_client.get_all_nodes()
             
@@ -205,43 +259,54 @@ class DNSManager:
             logger.info("Cluster state for sync", 
                        total_nodes=len(all_nodes),
                        healthy_nodes=len(healthy_nodes),
-                       nodes_with_all_deletion_taints=len(nodes_with_all_deletion_taints))
+                       nodes_with_all_deletion_taints=len(nodes_with_all_deletion_taints),
+                       service_configs=len(self.service_configs_cache))
             
-            # Sync DNS records for each hostname (delete invalid records)
-            sync_results = self.cf_client.sync_dns_records_for_hostnames(self.hostnames, healthy_ips)
+            # Sync DNS records for each service configuration (delete invalid records)
+            sync_results = self.cf_client.sync_dns_records_for_service_configs(
+                self.service_configs_cache, healthy_ips
+            )
             
             # Create missing DNS records for healthy nodes
             total_created = 0
             creation_errors = []
             
-            for hostname in self.hostnames:
+            for service_config in self.service_configs_cache:
                 try:
                     # Get current DNS records for this hostname
-                    current_records = self.cf_client.get_dns_records(hostname)
+                    current_records = self.cf_client.get_dns_records(service_config.hostname)
                     current_ips = {record.content for record in current_records}
                     
                     # Find healthy IPs that don't have DNS records
                     missing_ips = set(healthy_ips) - current_ips
                     
-                    # Create missing records
+                    # Create missing records with service-specific settings
                     for ip in missing_ips:
                         try:
-                            record = self.cf_client.create_dns_record(hostname, ip)
+                            record = self.cf_client.create_dns_record_from_service_config(
+                                service_config, ip
+                            )
                             if record:
                                 total_created += 1
                                 logger.info("Created missing DNS record during sync", 
-                                          hostname=hostname, ip=ip, record_id=record.id)
+                                          service=f"{service_config.service_namespace}/{service_config.service_name}",
+                                          hostname=service_config.hostname, 
+                                          ip=ip, 
+                                          record_id=record.id)
                         except Exception as e:
-                            error_msg = f"Failed to create DNS record for {hostname} -> {ip}: {str(e)}"
+                            error_msg = f"Failed to create DNS record for {service_config.hostname} -> {ip}: {str(e)}"
                             creation_errors.append(error_msg)
                             logger.error("Failed to create missing DNS record", 
-                                       hostname=hostname, ip=ip, error=str(e))
+                                       service=f"{service_config.service_namespace}/{service_config.service_name}",
+                                       hostname=service_config.hostname, 
+                                       ip=ip, error=str(e))
                 
                 except Exception as e:
-                    error_msg = f"Failed to check/create records for {hostname}: {str(e)}"
+                    error_msg = f"Failed to check/create records for {service_config.hostname}: {str(e)}"
                     creation_errors.append(error_msg)
                     logger.error("Error during record creation check", 
-                               hostname=hostname, error=str(e))
+                               service=f"{service_config.service_namespace}/{service_config.service_name}",
+                               hostname=service_config.hostname, error=str(e))
             
             # Calculate totals
             total_deleted = sum(result.get('records_deleted', 0) for result in sync_results.values())
@@ -253,7 +318,8 @@ class DNSManager:
                 errors.extend(result.get('errors', []))
             
             # Get current DNS record count
-            current_dns_records = self.cf_client.get_all_dns_records_for_hostnames(self.hostnames)
+            hostnames = [config.hostname for config in self.service_configs_cache]
+            current_dns_records = self.cf_client.get_all_dns_records_for_hostnames(hostnames)
             total_dns_records = sum(len(records) for records in current_dns_records.values())
             
             duration = time.time() - start_time
@@ -262,6 +328,8 @@ class DNSManager:
                 timestamp=sync_time,
                 nodes_checked=len(all_nodes),
                 nodes_with_deletion_taints=len(nodes_with_all_deletion_taints),
+                services_checked=len(self.service_configs_cache),
+                dns_configs_found=len(self.service_configs_cache),
                 dns_records_found=total_dns_records,
                 dns_records_created=total_created,
                 dns_records_deleted=total_deleted,
@@ -280,6 +348,7 @@ class DNSManager:
             logger.info("Completed full DNS synchronization", 
                        duration_seconds=duration,
                        nodes_checked=len(all_nodes),
+                       services_checked=len(self.service_configs_cache),
                        records_created=total_created,
                        records_deleted=total_deleted,
                        records_kept=total_kept,
@@ -296,6 +365,8 @@ class DNSManager:
                 timestamp=sync_time,
                 nodes_checked=0,
                 nodes_with_deletion_taints=0,
+                services_checked=0,
+                dns_configs_found=0,
                 dns_records_found=0,
                 dns_records_created=0,
                 dns_records_deleted=0,
@@ -307,9 +378,9 @@ class DNSManager:
             return sync_report
     
     def _record_event(self, event_id: str, event_type: str, node_name: str = None, 
-                     node_ip: str = None, dns_records: List[DNSRecord] = None,
-                     success: bool = True, error_message: str = None, 
-                     metadata: Dict = None):
+                     node_ip: str = None, service_configs: List[ServiceDNSConfig] = None,
+                     dns_records: List[DNSRecord] = None, success: bool = True, 
+                     error_message: str = None, metadata: Dict = None):
         """Record a DNS management event."""
         event = DNSManagementEvent(
             event_id=event_id,
@@ -317,6 +388,7 @@ class DNSManager:
             timestamp=datetime.now(),
             node_name=node_name,
             node_ip=node_ip,
+            service_configs=service_configs or [],
             dns_records=dns_records or [],
             success=success,
             error_message=error_message,
@@ -364,7 +436,8 @@ class DNSManager:
             dns_sync_status = {
                 'last_sync': self.last_sync_time.isoformat() if self.last_sync_time else None,
                 'total_syncs': len(self.sync_reports),
-                'recent_errors': len([r for r in self.sync_reports[-10:] if r.errors]) if self.sync_reports else 0
+                'recent_errors': len([r for r in self.sync_reports[-10:] if r.errors]) if self.sync_reports else 0,
+                'active_service_configs': len(self.service_configs_cache)
             }
             
             return HealthStatus(
@@ -396,13 +469,17 @@ class DNSManager:
     def get_current_dns_state(self) -> Dict:
         """Get current state of DNS records and cluster nodes."""
         try:
+            # Refresh service configs
+            self._refresh_service_configs()
+            
             # Get current nodes
             all_nodes = self.k8s_client.get_all_nodes()
             healthy_nodes = [node for node in all_nodes if not node.deletion_taints and node.external_ip]
             nodes_with_all_deletion_taints = [node for node in all_nodes if node.deletion_taints]
             
             # Get current DNS records
-            dns_records = self.cf_client.get_all_dns_records_for_hostnames(self.hostnames)
+            hostnames = [config.hostname for config in self.service_configs_cache]
+            dns_records = self.cf_client.get_all_dns_records_for_hostnames(hostnames)
             
             return {
                 'cluster_state': {
@@ -419,14 +496,24 @@ class DNSManager:
                         for node in nodes_with_all_deletion_taints
                     ]
                 },
+                'service_configs': [
+                    {
+                        'service': f"{config.service_namespace}/{config.service_name}",
+                        'hostname': config.hostname,
+                        'ttl': config.ttl,
+                        'proxied': config.proxied
+                    }
+                    for config in self.service_configs_cache
+                ],
                 'dns_state': {
-                    'hostnames': self.hostnames,
+                    'hostnames': hostnames,
                     'records_by_hostname': {
                         hostname: [
                             {
                                 'id': record.id,
                                 'content': record.content,
-                                'ttl': record.ttl
+                                'ttl': record.ttl,
+                                'proxied': record.proxied
                             }
                             for record in records
                         ]
@@ -441,5 +528,6 @@ class DNSManager:
             return {
                 'error': str(e),
                 'cluster_state': {},
+                'service_configs': [],
                 'dns_state': {}
             } 

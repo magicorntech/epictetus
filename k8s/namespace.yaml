@@ -8,18 +8,6 @@ metadata:
 
 ---
 apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: epictetus-config
-  namespace: epictetus
-  labels:
-    app: epictetus
-data:
-  # Comma-separated list of DNS hostnames to manage
-  dns-hostnames: "ap1-test.example.com,ap2-test.example.com"
-
----
-apiVersion: v1
 kind: Secret
 metadata:
   name: epictetus-secrets
@@ -31,9 +19,3 @@ data:
   # Base64 encoded values - replace these with your actual values
   # echo -n "your-cloudflare-api-token" | base64
   cloudflare-api-token: "eW91ci1jbG91ZGZsYXJlLWFwaS10b2tlbg=="
-  
-  # echo -n "your-cloudflare-zone-id" | base64  
-  cloudflare-zone-id: "eW91ci1jbG91ZGZsYXJlLXpvbmUtaWQ="
-  
-  # echo -n "$(openssl rand -hex 32)" | base64
-  secret-key: "eW91ci1zZWNyZXQta2V5LWhlcmU=" 

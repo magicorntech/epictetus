@@ -10,7 +10,7 @@ import signal
 import threading
 import time
 from app import create_app
-from app.config import Config
+from app.config import get_config, ConfigurationError
 from app.logger import get_logger
 
 logger = get_logger(__name__)
@@ -19,24 +19,20 @@ def main():
     """Main application entry point."""
     try:
         # Validate configuration
-        errors = Config.validate()
-        if errors:
-            print("Configuration validation failed:")
-            for error in errors:
-                print(f"  - {error}")
-            sys.exit(1)
+        config = get_config()
         
         # Create Flask application
         app = create_app()
         
         print(f"🏛️  Starting Epictetus - A poor man's load balancer")
-        print(f"📋 DNS Hostnames: {', '.join(app.config.get('DNS_HOSTNAMES', []))}")
-        print(f"⏱️  Sync Interval: {app.config.get('DNS_SYNC_INTERVAL', 60)} seconds")
-        print(f"📊 Log Level: {app.config.get('LOG_LEVEL', 'INFO')}")
+        print(f"📡 Annotation-based DNS management enabled")
+        print(f"⏱️  Sync Interval: {config.get('DNS_SYNC_INTERVAL', 60)} seconds")
+        print(f"🔧 Deletion Taints: {', '.join(config.get('DELETION_TAINTS', []))}")
+        print(f"📊 Log Level: {config.get('LOG_LEVEL', 'INFO')}")
         
         # Get configuration for optional health server
-        enable_health_server = os.environ.get('ENABLE_HEALTH_SERVER', 'true').lower() == 'true'
-        health_port = int(os.environ.get('HEALTH_PORT', '8080'))
+        enable_health_server = config.get('ENABLE_HEALTH_SERVER', True)
+        health_port = config.get('HEALTH_PORT', 8080)
         
         # Start minimal health check server in background if enabled
         if enable_health_server:
@@ -68,12 +64,20 @@ def main():
         
         print("🔄 Epictetus is now running...")
         print("📡 Watching for Kubernetes node events...")
+        print("📋 DNS configurations read from service annotations:")
+        print("    epictetus.io/dns-enabled=true")
+        print("    epictetus.io/hostname=your-hostname.com")
+        print("    epictetus.io/ttl=300 (optional)")
+        print("    epictetus.io/proxied=false (optional)")
         print("⚡ Press Ctrl+C to stop")
         
         # Main loop - just keep the service running
         while True:
             time.sleep(1)
         
+    except ConfigurationError as e:
+        print(f"❌ Configuration error: {e}")
+        sys.exit(1)
     except KeyboardInterrupt:
         print("\n🛑 Received interrupt signal, shutting down...")
         sys.exit(0)

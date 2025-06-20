@@ -1,32 +1,32 @@
-"""CloudFlare client for managing DNS records."""
+"""CloudFlare client for managing DNS records across multiple zones."""
 
-import CloudFlare
-from typing import List, Dict, Optional, Tuple
-from retrying import retry
 import time
+from typing import Dict, List, Optional
 from datetime import datetime
+import CloudFlare
+from retrying import retry
 
 from app.logger import get_logger
-from app.models import DNSRecord
+from app.models import DNSRecord, ServiceDNSConfig
 
 
 logger = get_logger(__name__)
 
 
 class CloudFlareClient:
-    """Production-ready CloudFlare client for DNS management."""
+    """Production-ready CloudFlare client for DNS management across multiple zones."""
     
     def __init__(self, app_config):
         """Initialize CloudFlare client."""
         self.config = app_config
         self.cf = None
-        self.zone_id = app_config.get('CLOUDFLARE_ZONE_ID')
-        self.zone_name = None
+        self.zones_cache = {}  # Cache zone info {zone_name: zone_id}
+        self.hostname_to_zone = {}  # Cache hostname to zone mapping
         
         # Initialize CloudFlare client
         self._init_client()
         
-        logger.info("CloudFlare client initialized", zone_id=self.zone_id)
+        logger.info("CloudFlare client initialized (multi-zone support)")
     
     def _init_client(self):
         """Initialize CloudFlare client with API token."""
@@ -37,23 +37,64 @@ class CloudFlareClient:
             
             self.cf = CloudFlare.CloudFlare(token=token)
             
-            # Verify connection and get zone info
-            zone_info = self.cf.zones.get(self.zone_id)
-            self.zone_name = zone_info['name']
+            # Load all available zones
+            self._refresh_zones_cache()
             
             logger.info("CloudFlare client authenticated", 
-                       zone_name=self.zone_name, zone_id=self.zone_id)
+                       available_zones=len(self.zones_cache))
             
         except Exception as e:
             logger.error("Failed to initialize CloudFlare client", error=str(e))
             raise
     
+    def _refresh_zones_cache(self):
+        """Refresh the cache of available zones."""
+        try:
+            zones = self.cf.zones.get()
+            self.zones_cache = {zone['name']: zone['id'] for zone in zones}
+            
+            logger.debug("Refreshed zones cache", 
+                        zones=list(self.zones_cache.keys()))
+            
+        except Exception as e:
+            logger.error("Failed to refresh zones cache", error=str(e))
+            raise
+    
+    def _get_zone_for_hostname(self, hostname: str) -> Optional[str]:
+        """Determine which zone a hostname belongs to."""
+        # Check cache first
+        if hostname in self.hostname_to_zone:
+            return self.hostname_to_zone[hostname]
+        
+        # Extract domain from hostname (e.g., api.example.com -> example.com)
+        parts = hostname.split('.')
+        
+        # Try different domain combinations (handles subdomains)
+        for i in range(len(parts)):
+            domain = '.'.join(parts[i:])
+            if domain in self.zones_cache:
+                zone_id = self.zones_cache[domain]
+                self.hostname_to_zone[hostname] = zone_id
+                logger.debug("Found zone for hostname", 
+                           hostname=hostname, domain=domain, zone_id=zone_id)
+                return zone_id
+        
+        # Zone not found
+        logger.warning("No zone found for hostname", 
+                      hostname=hostname, 
+                      available_zones=list(self.zones_cache.keys()))
+        return None
+    
     @retry(stop_max_attempt_number=3, wait_fixed=2000)
     def get_dns_records(self, hostname: str) -> List[DNSRecord]:
         """Get all A records for a specific hostname."""
         try:
+            zone_id = self._get_zone_for_hostname(hostname)
+            if not zone_id:
+                raise ValueError(f"No CloudFlare zone found for hostname: {hostname}")
+            
             records = self.cf.zones.dns_records.get(
-                self.zone_id,
+                zone_id,
                 params={'name': hostname, 'type': 'A'}
             )
             
@@ -74,7 +115,7 @@ class CloudFlareClient:
                 dns_records.append(dns_record)
             
             logger.info("Retrieved DNS records", 
-                       hostname=hostname, count=len(dns_records))
+                       hostname=hostname, zone_id=zone_id, count=len(dns_records))
             return dns_records
             
         except CloudFlare.exceptions.CloudFlareAPIError as e:
@@ -87,24 +128,29 @@ class CloudFlareClient:
             raise
     
     @retry(stop_max_attempt_number=3, wait_fixed=2000)
-    def create_dns_record(self, hostname: str, ip_address: str, ttl: int = 300) -> DNSRecord:
-        """Create a new A record for the hostname pointing to the IP address."""
+    def create_dns_record(self, hostname: str, ip_address: str, ttl: int = 300, 
+                         proxied: bool = False) -> DNSRecord:
+        """Create a new DNS A record."""
         try:
-            record_data = {
-                'name': hostname,
+            zone_id = self._get_zone_for_hostname(hostname)
+            if not zone_id:
+                raise ValueError(f"No CloudFlare zone found for hostname: {hostname}")
+            
+            data = {
                 'type': 'A',
+                'name': hostname,
                 'content': ip_address,
                 'ttl': ttl,
-                'proxied': False
+                'proxied': proxied
             }
             
-            result = self.cf.zones.dns_records.post(self.zone_id, data=record_data)
+            result = self.cf.zones.dns_records.post(zone_id, data=data)
             
             dns_record = DNSRecord(
                 id=result['id'],
                 name=result['name'],
-                type=result['type'],
                 content=result['content'],
+                type=result['type'],
                 ttl=result['ttl'],
                 proxied=result['proxied'],
                 zone_id=result['zone_id'],
@@ -114,7 +160,9 @@ class CloudFlareClient:
             )
             
             logger.info("Created DNS record", 
-                       hostname=hostname, ip_address=ip_address, record_id=dns_record.id)
+                       hostname=hostname, ip_address=ip_address, 
+                       zone_id=zone_id, record_id=dns_record.id, 
+                       ttl=ttl, proxied=proxied)
             return dns_record
             
         except CloudFlare.exceptions.CloudFlareAPIError as e:
@@ -127,21 +175,21 @@ class CloudFlareClient:
             raise
     
     @retry(stop_max_attempt_number=3, wait_fixed=2000)
-    def delete_dns_record(self, record_id: str) -> bool:
+    def delete_dns_record(self, record_id: str, zone_id: str) -> bool:
         """Delete a DNS record by ID."""
         try:
-            self.cf.zones.dns_records.delete(self.zone_id, record_id)
+            self.cf.zones.dns_records.delete(zone_id, record_id)
             
-            logger.info("Deleted DNS record", record_id=record_id)
+            logger.info("Deleted DNS record", record_id=record_id, zone_id=zone_id)
             return True
             
         except CloudFlare.exceptions.CloudFlareAPIError as e:
             logger.error("CloudFlare API error deleting DNS record", 
-                        record_id=record_id, error=str(e))
+                        record_id=record_id, zone_id=zone_id, error=str(e))
             raise
         except Exception as e:
             logger.error("Unexpected error deleting DNS record", 
-                        record_id=record_id, error=str(e))
+                        record_id=record_id, zone_id=zone_id, error=str(e))
             raise
     
     def delete_dns_records_by_ip(self, hostname: str, ip_address: str) -> List[str]:
@@ -156,7 +204,7 @@ class CloudFlareClient:
             deleted_record_ids = []
             for record in matching_records:
                 try:
-                    self.delete_dns_record(record.id)
+                    self.delete_dns_record(record.id, record.zone_id)
                     deleted_record_ids.append(record.id)
                 except Exception as e:
                     logger.error("Failed to delete DNS record", 
@@ -212,11 +260,11 @@ class CloudFlareClient:
                 if record.content not in valid_ips:
                     # Delete record for invalid IP
                     try:
-                        self.delete_dns_record(record.id)
+                        self.delete_dns_record(record.id, record.zone_id)
                         records_deleted += 1
                         logger.info("Deleted DNS record for invalid IP", 
                                    hostname=hostname, ip=record.content, 
-                                   record_id=record.id)
+                                   record_id=record.id, zone_id=record.zone_id)
                     except Exception as e:
                         error_msg = f"Failed to delete record {record.id}: {str(e)}"
                         errors.append(error_msg)
@@ -288,22 +336,88 @@ class CloudFlareClient:
     def health_check(self) -> Dict[str, any]:
         """Perform health check on CloudFlare connectivity."""
         try:
-            # Try to get zone info
-            zone_info = self.cf.zones.get(self.zone_id)
+            # Try to refresh zones cache
+            self._refresh_zones_cache()
             
-            # Try to get a sample of DNS records
-            sample_records = self.cf.zones.dns_records.get(self.zone_id, params={'per_page': 1})
+            # Try to get user info
+            user_info = self.cf.user.get()
             
             return {
                 'status': 'healthy',
                 'api_accessible': True,
-                'zone_accessible': True,
-                'zone_name': zone_info['name'],
-                'zone_status': zone_info['status']
+                'available_zones': len(self.zones_cache),
+                'zones': list(self.zones_cache.keys()),
+                'user_email': user_info.get('email', 'unknown')
             }
         except Exception as e:
             return {
                 'status': 'unhealthy',
                 'error': str(e),
                 'api_accessible': False
-            } 
+            }
+    
+    def create_dns_record_from_service_config(self, service_config: ServiceDNSConfig, 
+                                             ip_address: str) -> Optional[DNSRecord]:
+        """Create DNS record based on service configuration."""
+        try:
+            # Check if record already exists
+            existing_records = self.get_dns_records(service_config.hostname)
+            for record in existing_records:
+                if record.content == ip_address:
+                    logger.info("DNS record already exists for service config", 
+                               service=f"{service_config.service_namespace}/{service_config.service_name}",
+                               hostname=service_config.hostname, 
+                               ip_address=ip_address)
+                    return record
+            
+            # Create new record with service-specific settings
+            new_record = self.create_dns_record(
+                hostname=service_config.hostname,
+                ip_address=ip_address,
+                ttl=service_config.ttl,
+                proxied=service_config.proxied
+            )
+            
+            logger.info("Created DNS record from service config", 
+                       service=f"{service_config.service_namespace}/{service_config.service_name}",
+                       hostname=service_config.hostname, 
+                       ip_address=ip_address,
+                       record_id=new_record.id,
+                       zone_id=new_record.zone_id,
+                       ttl=service_config.ttl,
+                       proxied=service_config.proxied)
+            
+            return new_record
+            
+        except Exception as e:
+            logger.error("Failed to create DNS record from service config", 
+                        service=f"{service_config.service_namespace}/{service_config.service_name}",
+                        hostname=service_config.hostname, 
+                        ip_address=ip_address, 
+                        error=str(e))
+            raise
+
+    def sync_dns_records_for_service_configs(self, service_configs: List[ServiceDNSConfig], 
+                                           valid_ips: List[str]) -> Dict[str, Dict]:
+        """Sync DNS records for service configurations, keeping only valid IPs."""
+        results = {}
+        
+        for config in service_configs:
+            hostname = config.hostname
+            try:
+                result = self.sync_dns_records_for_hostname(hostname, valid_ips)
+                results[hostname] = result
+                results[hostname]['service'] = f"{config.service_namespace}/{config.service_name}"
+            except Exception as e:
+                logger.error("Failed to sync DNS records for service config", 
+                           service=f"{config.service_namespace}/{config.service_name}",
+                           hostname=hostname, error=str(e))
+                results[hostname] = {
+                    'success': False,
+                    'error': str(e),
+                    'records_deleted': 0,
+                    'records_kept': 0,
+                    'service': f"{config.service_namespace}/{config.service_name}"
+                }
+        
+        return results 

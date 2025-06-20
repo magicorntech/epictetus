@@ -9,7 +9,7 @@ import threading
 import time
 
 from app.logger import get_logger
-from app.models import NodeInfo, TaintInfo
+from app.models import NodeInfo, TaintInfo, ServiceDNSConfig
 
 
 logger = get_logger(__name__)
@@ -235,36 +235,40 @@ class KubernetesClient:
         
         return False
     
-    def get_services_with_dns_annotations(self) -> List[Dict]:
-        """Get services that have DNS-related annotations."""
+    def get_services_with_dns_annotations(self) -> List[ServiceDNSConfig]:
+        """Get services that have Epictetus DNS management annotations."""
         try:
             services = self.v1.list_service_for_all_namespaces()
-            dns_services = []
+            dns_configs = []
             
             for service in services.items:
-                if service.metadata.annotations:
-                    # Look for common DNS annotations
-                    dns_annotations = {
-                        k: v for k, v in service.metadata.annotations.items()
-                        if any(dns_key in k.lower() for dns_key in ['dns', 'external-dns', 'hostname'])
-                    }
-                    
-                    if dns_annotations:
-                        dns_services.append({
-                            'name': service.metadata.name,
-                            'namespace': service.metadata.namespace,
-                            'annotations': dns_annotations,
-                            'type': service.spec.type,
-                            'cluster_ip': service.spec.cluster_ip,
-                            'external_ips': service.spec.external_i_ps or []
-                        })
+                if not service.metadata.annotations:
+                    continue
+                
+                # Try to create DNS config from annotations
+                dns_config = ServiceDNSConfig.from_service_annotations(
+                    service_name=service.metadata.name,
+                    service_namespace=service.metadata.namespace,
+                    annotations=service.metadata.annotations
+                )
+                
+                if dns_config:
+                    dns_configs.append(dns_config)
+                    logger.debug("Found service with DNS config", 
+                               service=f"{dns_config.service_namespace}/{dns_config.service_name}",
+                               hostname=dns_config.hostname,
+                               ttl=dns_config.ttl,
+                               proxied=dns_config.proxied)
             
-            logger.info("Found services with DNS annotations", count=len(dns_services))
-            return dns_services
+            logger.info("Found services with Epictetus DNS annotations", count=len(dns_configs))
+            return dns_configs
             
         except ApiException as e:
             logger.error("Kubernetes API error getting services", 
                         status=e.status, reason=e.reason)
+            raise
+        except Exception as e:
+            logger.error("Unexpected error getting services with DNS annotations", error=str(e))
             raise
     
     def health_check(self) -> Dict[str, any]:
