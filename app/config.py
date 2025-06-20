@@ -126,8 +126,7 @@ def get_config() -> Dict[str, Any]:
         'RETRY_DELAY': int(os.getenv('RETRY_DELAY', '5')),
         
         # Service Configuration
-        'SERVICE_NAME': 'epictetus',
-        'SERVICE_VERSION': '1.1.0'  # Updated for multi-zone support
+        'SERVICE_NAME': 'epictetus'
     }
     
     # Validate required configuration
