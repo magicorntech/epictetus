@@ -77,7 +77,12 @@ class KubernetesClient:
             raise
     
     def _extract_node_info(self, node) -> NodeInfo:
-        """Extract relevant information from a Kubernetes node object."""
+        """Extract relevant information from a Kubernetes node object.
+        
+        For external IP detection:
+        1. First checks node.status.addresses for ExternalIP type
+        2. Falls back to flannel.alpha.coreos.com/public-ip annotation if no ExternalIP found
+        """
         # Get node name
         name = node.metadata.name
         
@@ -88,6 +93,16 @@ class KubernetesClient:
                 if addr.type == "ExternalIP":
                     external_ip = addr.address
                     break
+        
+        # Fallback: Check Flannel annotation if no external IP found
+        if not external_ip:
+            annotations = node.metadata.annotations or {}
+            flannel_public_ip = annotations.get('flannel.alpha.coreos.com/public-ip')
+            if flannel_public_ip:
+                external_ip = flannel_public_ip
+                logger.debug("Using Flannel public IP annotation", 
+                           node_name=node.metadata.name, 
+                           external_ip=external_ip)
         
         # Extract taints
         taints = []

@@ -8,6 +8,8 @@ A production-ready standalone service that automatically manages CloudFlare DNS 
 - **🌐 Multi-Zone Support**: Automatically manages DNS across multiple CloudFlare zones/domains
 - **🔍 Auto Zone Detection**: No need to specify zone IDs - automatically detects which zone each hostname belongs to
 - **📋 Service Annotation Configuration**: DNS settings configured via Kubernetes service annotations (no ConfigMaps needed)
+- **🏠 Multi-Environment Support**: Works with cloud providers (AWS, GCP, Azure) AND bare metal/on-premise with Flannel CNI
+- **🔌 Smart IP Detection**: Automatic fallback from cloud provider ExternalIP to Flannel annotations
 - **Real-time Node Monitoring**: Watches Kubernetes nodes for deletion taints (`DeletionCandidateOfClusterAutoscaler`, `ToBeDeletedByClusterAutoscaler`)
 - **Conservative DNS Management**: Only removes DNS records when **BOTH** deletion taints are present
 - **Automatic DNS Management**: Creates/deletes CloudFlare DNS A records based on node external IPs
@@ -39,6 +41,7 @@ A production-ready standalone service that automatically manages CloudFlare DNS 
 - CloudFlare API Token with DNS edit permissions for **all zones** you want to manage
 - Kubernetes cluster access (via kubeconfig or in-cluster)
 - Services annotated with Epictetus DNS management settings
+- **Node External IPs**: Either cloud provider `ExternalIP` support OR Flannel CNI with `flannel.alpha.coreos.com/public-ip` annotations
 
 ### Environment Setup
 
@@ -343,6 +346,48 @@ This conservative approach ensures that DNS records are only removed when the cl
 - **Zone-Aware Operations**: Routes DNS operations to the correct CloudFlare zone
 - **Service-Specific Settings**: Each service can have different TTL and proxy settings
 
+### External IP Detection
+
+Epictetus uses a **two-stage approach** to detect node external IP addresses:
+
+#### 1. Primary Method: Cloud Provider ExternalIP
+
+First checks the standard Kubernetes `node.status.addresses` field for `ExternalIP` type:
+- ✅ **Works with cloud providers** (AWS, GCP, Azure, etc.)
+- ✅ **Standard Kubernetes approach** 
+- ✅ **Automatic with most managed clusters**
+
+#### 2. Fallback Method: Flannel Annotation
+
+If no external IP is found in the standard field, falls back to the Flannel CNI annotation:
+- 🔧 **Annotation**: `flannel.alpha.coreos.com/public-ip`
+- 🏠 **Perfect for bare metal** and on-premise clusters
+- 🌐 **Works with Flannel CNI** deployments
+- 📝 **Debug logging** when fallback is used
+
+#### Deployment Compatibility
+
+| Environment | Detection Method | Notes |
+|-------------|------------------|-------|
+| **AWS EKS** | ExternalIP field | Standard cloud provider behavior |
+| **GCP GKE** | ExternalIP field | Standard cloud provider behavior |
+| **Azure AKS** | ExternalIP field | Standard cloud provider behavior |
+| **Bare Metal + Flannel** | Flannel annotation | Requires `flannel.alpha.coreos.com/public-ip` |
+| **On-Premise + Flannel** | Flannel annotation | Requires `flannel.alpha.coreos.com/public-ip` |
+| **Other CNIs** | ExternalIP field | Depends on CNI external IP support |
+
+#### Behavior
+
+- **Graceful Fallback**: Only uses annotation when standard field is empty
+- **No Configuration Needed**: Automatically detects which method to use
+- **Debug Visibility**: Logs when fallback method is used
+- **Backward Compatible**: Existing deployments continue working unchanged
+
+Example log output when fallback is used:
+```
+DEBUG Using Flannel public IP annotation node_name=worker-1 external_ip=192.168.1.100
+```
+
 ## Monitoring
 
 ### Health Checks
@@ -405,6 +450,12 @@ Epictetus uses structured logging with configurable formats:
    - Verify node external IPs are accessible
    - Ensure hostnames match domains in your CloudFlare zones
    - Confirm that **BOTH** deletion taints are present before expecting DNS removal
+
+6. **External IP Not Detected**:
+   - **Cloud Providers**: Verify your cloud provider populates the `ExternalIP` field in node status
+   - **Bare Metal/On-Premise**: Ensure Flannel is configured with the `flannel.alpha.coreos.com/public-ip` annotation
+   - **Debug**: Enable debug logging to see which detection method is being used
+   - **Check Node**: `kubectl get nodes -o wide` to see if external IPs are visible to Kubernetes
 
 ### Debugging
 
