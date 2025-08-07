@@ -348,7 +348,7 @@ This conservative approach ensures that DNS records are only removed when the cl
 
 ### External IP Detection
 
-Epictetus uses a **two-stage approach** to detect node external IP addresses:
+Epictetus uses a **three-stage approach** to detect node external IP addresses:
 
 #### 1. Primary Method: Cloud Provider ExternalIP
 
@@ -365,6 +365,14 @@ If no external IP is found in the standard field, falls back to the Flannel CNI 
 - 🌐 **Works with Flannel CNI** deployments
 - 📝 **Debug logging** when fallback is used
 
+#### 3. Final Fallback Method: Custom Label
+
+If no external IP is found from the previous methods, checks for a custom node label:
+- 🏷️ **Label**: `k8s.magicorn.net/external-ip`
+- 🔧 **Manual Configuration**: Allows manual override of external IP
+- 🎯 **Custom Environments**: Perfect for specialized deployments
+- 📝 **Debug logging** when label is used
+
 #### Deployment Compatibility
 
 | Environment | Detection Method | Notes |
@@ -372,20 +380,22 @@ If no external IP is found in the standard field, falls back to the Flannel CNI 
 | **AWS EKS** | ExternalIP field | Standard cloud provider behavior |
 | **GCP GKE** | ExternalIP field | Standard cloud provider behavior |
 | **Azure AKS** | ExternalIP field | Standard cloud provider behavior |
-| **Bare Metal + Flannel** | Flannel annotation | Requires `flannel.alpha.coreos.com/public-ip` |
 | **On-Premise + Flannel** | Flannel annotation | Requires `flannel.alpha.coreos.com/public-ip` |
+| **Custom/Manual** | Custom label | Requires `k8s.magicorn.net/external-ip` label |
 | **Other CNIs** | ExternalIP field | Depends on CNI external IP support |
 
 #### Behavior
 
-- **Graceful Fallback**: Only uses annotation when standard field is empty
+- **Graceful Fallback Chain**: Tries each method in sequence until external IP is found
 - **No Configuration Needed**: Automatically detects which method to use
-- **Debug Visibility**: Logs when fallback method is used
+- **Debug Visibility**: Logs which detection method was used
 - **Backward Compatible**: Existing deployments continue working unchanged
 
-Example log output when fallback is used:
+Example log output showing detection methods:
 ```
 DEBUG Using Flannel public IP annotation node_name=worker-1 external_ip=192.168.1.100
+DEBUG Using k8s.magicorn.net/external-ip label node_name=worker-2 external_ip=10.0.0.50
+DEBUG Node external IP detection node_name=worker-3 ip_source=node_status final_external_ip=203.0.113.10
 ```
 
 ## Monitoring

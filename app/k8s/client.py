@@ -79,9 +79,10 @@ class KubernetesClient:
     def _extract_node_info(self, node) -> NodeInfo:
         """Extract relevant information from a Kubernetes node object.
         
-        For external IP detection:
-        1. First checks node.status.addresses for ExternalIP type
-        2. Falls back to flannel.alpha.coreos.com/public-ip annotation if no ExternalIP found
+        For external IP detection (three-stage approach):
+        1. First checks node.status.addresses for ExternalIP type (cloud providers)
+        2. Falls back to flannel.alpha.coreos.com/public-ip annotation (Flannel CNI)
+        3. Falls back to k8s.magicorn.net/external-ip label (custom label)
         """
         # Get node name
         name = node.metadata.name
@@ -94,13 +95,23 @@ class KubernetesClient:
                     external_ip = addr.address
                     break
         
-        # Fallback: Check Flannel annotation if no external IP found
+        # Fallback 1: Check Flannel annotation if no external IP found
         if not external_ip:
             annotations = node.metadata.annotations or {}
             flannel_public_ip = annotations.get('flannel.alpha.coreos.com/public-ip')
             if flannel_public_ip:
                 external_ip = flannel_public_ip
                 logger.debug("Using Flannel public IP annotation", 
+                           node_name=node.metadata.name, 
+                           external_ip=external_ip)
+        
+        # Fallback 2: Check k8s.magicorn.net/external-ip label if still no external IP found
+        if not external_ip:
+            labels = node.metadata.labels or {}
+            label_external_ip = labels.get('k8s.magicorn.net/external-ip')
+            if label_external_ip:
+                external_ip = label_external_ip
+                logger.debug("Using k8s.magicorn.net/external-ip label", 
                            node_name=node.metadata.name, 
                            external_ip=external_ip)
         
@@ -141,7 +152,7 @@ class KubernetesClient:
                     ready = condition.status == "True"
                     break
         
-        return NodeInfo(
+        node_info = NodeInfo(
             name=name,
             external_ip=external_ip,
             taints=taints,
@@ -151,11 +162,51 @@ class KubernetesClient:
             ready=ready,
             creation_timestamp=node.metadata.creation_timestamp
         )
+        
+        # Log external IP detection details
+        external_ip_from_status = None
+        if node.status.addresses:
+            for addr in node.status.addresses:
+                if addr.type == "ExternalIP":
+                    external_ip_from_status = addr.address
+                    break
+        
+        external_ip_label = labels.get('k8s.magicorn.net/external-ip')
+        flannel_annotation = annotations.get('flannel.alpha.coreos.com/public-ip')
+        
+        # Determine which source was used
+        ip_source = "none"
+        if external_ip:
+            if external_ip == external_ip_from_status:
+                ip_source = "node_status"
+            elif external_ip == flannel_annotation:
+                ip_source = "flannel_annotation"
+            elif external_ip == external_ip_label:
+                ip_source = "magicorn_label"
+        
+        logger.debug("Node external IP detection", 
+                   node_name=name,
+                   external_ip_from_status=external_ip_from_status,
+                   flannel_annotation=flannel_annotation,
+                   external_ip_label=external_ip_label,
+                   final_external_ip=external_ip,
+                   ip_source=ip_source,
+                   has_external_ip_label='k8s.magicorn.net/external-ip' in labels)
+        
+        return node_info
     
     def get_nodes_with_deletion_taints(self) -> List[NodeInfo]:
         """Get nodes that have ALL deletion taints (both DeletionCandidate and ToBeDeleted)."""
         nodes = self.get_all_nodes()
         return [node for node in nodes if node.deletion_taints]
+    
+    def check_external_ip_label(self, node_info: NodeInfo) -> bool:
+        """Check if node has the k8s.magicorn.net/external-ip label."""
+        return 'k8s.magicorn.net/external-ip' in node_info.labels
+    
+    def get_external_ip_label_value(self, node_info: NodeInfo) -> Optional[str]:
+        """Get the value of the k8s.magicorn.net/external-ip label if present."""
+        return node_info.labels.get('k8s.magicorn.net/external-ip')
     
     def register_event_callback(self, callback: Callable[[str, NodeInfo], None]):
         """Register a callback for node events."""
@@ -200,7 +251,10 @@ class KubernetesClient:
                     logger.info("Node event received", 
                               event_type=event_type,
                               node_name=node_info.name,
-                              has_all_deletion_taints=bool(node_info.deletion_taints))
+                              has_all_deletion_taints=bool(node_info.deletion_taints),
+                              external_ip=node_info.external_ip,
+                              has_external_ip_label='k8s.magicorn.net/external-ip' in node_info.labels,
+                              external_ip_label_value=node_info.labels.get('k8s.magicorn.net/external-ip'))
                     
                     # Update cache
                     old_node = self.node_cache.get(node_info.name)

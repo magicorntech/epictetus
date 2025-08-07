@@ -96,7 +96,10 @@ class DNSManager:
                        event_type=event_type, 
                        node_name=node_info.name,
                        external_ip=node_info.external_ip,
-                       has_all_deletion_taints=len(node_info.deletion_taints))
+                       has_all_deletion_taints=len(node_info.deletion_taints),
+                       has_external_ip_label='k8s.magicorn.net/external-ip' in node_info.labels,
+                       external_ip_label_value=node_info.labels.get('k8s.magicorn.net/external-ip'),
+                       flannel_annotation=node_info.annotations.get('flannel.alpha.coreos.com/public-ip'))
             
             if event_type == "ADDED":
                 self._handle_node_added(event_id, node_info)
@@ -249,18 +252,42 @@ class DNSManager:
             # Get all current nodes
             all_nodes = self.k8s_client.get_all_nodes()
             
+            # Analyze all nodes for detailed logging
+            nodes_with_external_ip_label = [node for node in all_nodes if 'k8s.magicorn.net/external-ip' in node.labels]
+            nodes_with_deletion_taints = [node for node in all_nodes if node.deletion_taints]
+            nodes_without_external_ip = [node for node in all_nodes if not node.external_ip]
+            
             # Get nodes without ALL deletion taints (these should have DNS records)
             healthy_nodes = [node for node in all_nodes if not node.deletion_taints and node.external_ip]
             healthy_ips = [node.external_ip for node in healthy_nodes]
             
-            # Get nodes with ALL deletion taints
-            nodes_with_all_deletion_taints = [node for node in all_nodes if node.deletion_taints]
-            
-            logger.info("Cluster state for sync", 
+            # Log detailed analysis
+            logger.info("Cluster state analysis for sync", 
                        total_nodes=len(all_nodes),
+                       nodes_with_external_ip_label=len(nodes_with_external_ip_label),
+                       nodes_with_deletion_taints=len(nodes_with_deletion_taints),
+                       nodes_without_external_ip=len(nodes_without_external_ip),
                        healthy_nodes=len(healthy_nodes),
-                       nodes_with_all_deletion_taints=len(nodes_with_all_deletion_taints),
                        service_configs=len(self.service_configs_cache))
+            
+            # Log nodes that have the label but are excluded from DNS
+            excluded_labeled_nodes = [node for node in nodes_with_external_ip_label 
+                                    if node not in healthy_nodes]
+            if excluded_labeled_nodes:
+                for node in excluded_labeled_nodes:
+                    reason = []
+                    if node.deletion_taints:
+                        reason.append(f"has_deletion_taints({len(node.deletion_taints)})")
+                    if not node.external_ip:
+                        reason.append("no_external_ip")
+                    if not node.ready:
+                        reason.append("not_ready")
+                    
+                    logger.warning("Node with k8s.magicorn.net/external-ip label excluded from DNS", 
+                                 node_name=node.name,
+                                 external_ip_label=node.labels.get('k8s.magicorn.net/external-ip'),
+                                 resolved_external_ip=node.external_ip,
+                                 exclusion_reasons=reason)
             
             # Sync DNS records for each service configuration (delete invalid records)
             sync_results = self.cf_client.sync_dns_records_for_service_configs(
@@ -432,12 +459,29 @@ class DNSManager:
             if cf_health.get('status') != 'healthy':
                 errors.append(f"CloudFlare: {cf_health.get('error', 'Unknown error')}")
             
+            # Get node summary for health status
+            try:
+                all_nodes = self.k8s_client.get_all_nodes()
+                nodes_with_external_ip_label = [node for node in all_nodes if 'k8s.magicorn.net/external-ip' in node.labels]
+                healthy_nodes = [node for node in all_nodes if not node.deletion_taints and node.external_ip]
+            except Exception as e:
+                logger.warning("Could not get node information for health status", error=str(e))
+                all_nodes = []
+                nodes_with_external_ip_label = []
+                healthy_nodes = []
+            
             # DNS sync status
             dns_sync_status = {
                 'last_sync': self.last_sync_time.isoformat() if self.last_sync_time else None,
                 'total_syncs': len(self.sync_reports),
                 'recent_errors': len([r for r in self.sync_reports[-10:] if r.errors]) if self.sync_reports else 0,
-                'active_service_configs': len(self.service_configs_cache)
+                'active_service_configs': len(self.service_configs_cache),
+                'cluster_summary': {
+                    'total_nodes': len(all_nodes),
+                    'healthy_nodes': len(healthy_nodes),
+                    'nodes_with_external_ip_label': len(nodes_with_external_ip_label),
+                    'external_ip_label_coverage': f"{len(nodes_with_external_ip_label)}/{len(all_nodes)}" if all_nodes else "0/0"
+                }
             }
             
             return HealthStatus(
@@ -476,6 +520,7 @@ class DNSManager:
             all_nodes = self.k8s_client.get_all_nodes()
             healthy_nodes = [node for node in all_nodes if not node.deletion_taints and node.external_ip]
             nodes_with_all_deletion_taints = [node for node in all_nodes if node.deletion_taints]
+            nodes_with_external_ip_label = [node for node in all_nodes if 'k8s.magicorn.net/external-ip' in node.labels]
             
             # Get current DNS records
             hostnames = [config.hostname for config in self.service_configs_cache]
@@ -487,6 +532,7 @@ class DNSManager:
                     'healthy_nodes': len(healthy_nodes),
                     'healthy_node_ips': [node.external_ip for node in healthy_nodes],
                     'nodes_with_all_deletion_taints': len(nodes_with_all_deletion_taints),
+                    'nodes_with_external_ip_label': len(nodes_with_external_ip_label),
                     'deletion_taint_nodes': [
                         {
                             'name': node.name,
@@ -494,6 +540,16 @@ class DNSManager:
                             'taints': [{'key': t.key, 'effect': t.effect} for t in node.deletion_taints]
                         }
                         for node in nodes_with_all_deletion_taints
+                    ],
+                    'external_ip_label_nodes': [
+                        {
+                            'name': node.name,
+                            'external_ip': node.external_ip,
+                            'external_ip_label_value': node.labels.get('k8s.magicorn.net/external-ip'),
+                            'flannel_annotation': node.annotations.get('flannel.alpha.coreos.com/public-ip'),
+                            'ready': node.ready
+                        }
+                        for node in nodes_with_external_ip_label
                     ]
                 },
                 'service_configs': [
