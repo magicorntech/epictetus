@@ -5,31 +5,20 @@ A production-ready Kubernetes controller that automatically manages Cloudflare D
 
 ## Architecture
 
-```
-┌─────────────────────────────────────────────────────────┐
-│                     Epictetus (Go)                      │
-│                                                         │
-│  SharedInformerFactory                                  │
-│  ┌─────────────────┐      ┌──────────────────────┐     │
-│  │  Node Informer  │      │  Service Informer     │     │
-│  │  (watch+cache)  │      │  (watch+cache)        │     │
-│  └────────┬────────┘      └──────────┬───────────┘     │
-│    state change only         annotation change          │
-│           │                          │                  │
-│           ▼                          ▼                  │
-│  ┌─────────────────┐      ┌──────────────────────┐     │
-│  │  Work Queue     │      │  ServiceStore (mem)   │     │
-│  │  (rate-limited, │      │  (RWMutex map)        │     │
-│  │  deduplicated)  │      └──────────────────────┘     │
-│  └────────┬────────┘                                   │
-│           │ N workers                                   │
-│           ▼                                             │
-│  ┌─────────────────┐                                   │
-│  │   Reconciler    │─── goroutines per hostname ──▶ CF │
-│  │  (no K8s API    │                                   │
-│  │   calls here)   │                                   │
-│  └─────────────────┘                                   │
-└─────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    NI["Node Informer\n(watch + cache)"]
+    SI["Service Informer\n(watch + cache)"]
+    WQ["Work Queue\n(rate-limited, deduplicated)"]
+    SS["ServiceStore\n(in-memory, RWMutex)"]
+    R["Reconciler\n(zero K8s API calls)"]
+    CF["Cloudflare API"]
+
+    NI -->|"state change only"| WQ
+    SI -->|"annotation change"| SS
+    WQ -->|"N workers"| R
+    SS -->|"config lookup"| R
+    R -->|"goroutines per hostname"| CF
 ```
 
 **How it works:**
