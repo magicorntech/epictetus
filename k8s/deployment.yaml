@@ -46,6 +46,13 @@ spec:
           value: "true"
         - name: HEALTH_PORT
           value: "8080"
+        # Enhanced Node Health Monitoring Configuration
+        - name: UNHEALTHY_NODE_TAINTS
+          value: "all"   # Options: none, critical, all, custom:taint1,taint2
+        - name: REMOVE_ON_NOT_READY
+          value: "true"  # Remove DNS records when node Ready condition is False
+        - name: REMOVE_ON_UNREACHABLE
+          value: "true"  # Remove DNS records when node Ready condition is Unknown
         - name: CLOUDFLARE_API_TOKEN
           valueFrom:
             secretKeyRef:
@@ -92,6 +99,9 @@ spec:
         kubernetes.io/os: linux
       tolerations:
       - key: "node-role.kubernetes.io/master"
+        operator: "Exists"
+        effect: "NoSchedule"
+      - key: "node.cilium.io/agent-not-ready"
         operator: "Exists"
         effect: "NoSchedule"
       affinity:
