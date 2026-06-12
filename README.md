@@ -1,127 +1,147 @@
 # Epictetus
 ## A poor man's load balancer
 
-A production-ready standalone service that automatically manages CloudFlare DNS records across **multiple zones** based on Kubernetes node lifecycle events. Epictetus monitors for cluster autoscaler taints and automatically removes DNS records only when **BOTH** deletion taints are present on a node, ensuring conservative and reliable DNS management.
-
-## Features
-
-- **🌐 Multi-Zone Support**: Automatically manages DNS across multiple CloudFlare zones/domains
-- **🔍 Auto Zone Detection**: No need to specify zone IDs - automatically detects which zone each hostname belongs to
-- **📋 Service Annotation Configuration**: DNS settings configured via Kubernetes service annotations (no ConfigMaps needed)
-- **🏠 Multi-Environment Support**: Works with cloud providers (AWS, GCP, Azure) AND bare metal/on-premise with Flannel CNI
-- **🔌 Smart IP Detection**: Automatic fallback from cloud provider ExternalIP to Flannel annotations
-- **Real-time Node Monitoring**: Watches Kubernetes nodes for deletion taints (`DeletionCandidateOfClusterAutoscaler`, `ToBeDeletedByClusterAutoscaler`)
-- **Conservative DNS Management**: Only removes DNS records when **BOTH** deletion taints are present
-- **Automatic DNS Management**: Creates/deletes CloudFlare DNS A records based on node external IPs
-- **Service-Specific Settings**: Each service can have different TTL, proxy settings, and hostnames
-- **Scheduled Synchronization**: Performs full DNS synchronization every minute to ensure consistency
-- **Live Event Processing**: Responds immediately to Kubernetes node events
-- **Production Ready**: Includes health checks, structured logging, and error handling
-- **Battle Tested**: Designed for high availability with retry logic and graceful degradation
+A production-ready Kubernetes controller that automatically manages Cloudflare DNS records based on node lifecycle events. Epictetus watches nodes and services using **informers** — reacting to changes in real time with zero polling — and fans out DNS operations concurrently across all hostnames.
 
 ## Architecture
 
 ```
-┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
-│   Kubernetes    │    │    Epictetus    │    │   CloudFlare    │
-│     Cluster     │───▶│  DNS Manager    │───▶│   Multi-Zone    │
-│                 │    │                 │    │      API        │
-│ • Node Events   │    │ • Event Watch   │    │ • DNS Records   │
-│ • Taints        │    │ • Zone Detect   │    │ • A Records     │
-│ • Service       │    │ • Sync Jobs     │    │ • Multi-Domain  │
-│   Annotations   │    │ • Health Check  │    │ • Zone Mgmt     │
-└─────────────────┘    └─────────────────┘    └─────────────────┘
+┌─────────────────────────────────────────────────────────┐
+│                     Epictetus (Go)                      │
+│                                                         │
+│  SharedInformerFactory                                  │
+│  ┌─────────────────┐   ┌──────────────────────────┐    │
+│  │  Node Informer  │   │   Service Informer        │    │
+│  │  (watch+cache)  │   │   (watch+cache)           │    │
+│  └────────┬────────┘   └────────────┬─────────────┘    │
+│           │ state change only        │ annotation change │
+│           ▼                          ▼                   │
+│  ┌─────────────────┐   ┌──────────────────────────┐    │
+│  │  Work Queue     │   │   ServiceStore (in-mem)   │    │
+│  │  (rate-limited, │   │   (RWMutex map)           │    │
+│  │   deduplicated) │   └──────────────────────────┘    │
+│  └────────┬────────┘                                    │
+│           │ N workers                                   │
+│           ▼                                             │
+│  ┌─────────────────┐                                    │
+│  │   Reconciler    │── goroutines per hostname ──▶ CF   │
+│  │   (no K8s API   │                                    │
+│  │    calls here)  │                                    │
+│  └─────────────────┘                                    │
+└─────────────────────────────────────────────────────────┘
 ```
+
+**How it works:**
+1. Node informer delivers ADDED/MODIFIED/DELETED events; a `nodeStateChanged` filter discards high-frequency heartbeat updates and only enqueues on taint, ready condition, or external IP changes
+2. Service informer keeps `ServiceStore` up-to-date reactively — no polling, no K8s API calls during reconciliation
+3. Work queue deduplicates burst events (e.g. 50 nodes getting a taint simultaneously → 50 queue items processed by N workers in parallel)
+4. Reconciler reads service configs from memory, then fans out Cloudflare API calls concurrently across all hostnames
+5. A periodic full sync runs as a safety net to catch any missed events
+
+## Features
+
+- **Event-driven**: node state changes trigger immediate DNS reconciliation, not a polling loop
+- **Multi-zone**: auto-discovers all Cloudflare zones; no zone IDs needed
+- **Service annotation config**: DNS settings live on K8s services (`epictetus.io/dns-enabled`, etc.)
+- **Multiple hostnames per service**: comma-separated or JSON array
+- **Multi-environment**: cloud provider ExternalIP → Flannel annotation → custom label fallback
+- **Conservative autoscaler handling**: requires BOTH deletion taints before removing records
+- **Structured logging**: `log/slog` with text (dev) or JSON (prod) format
+- **Health endpoints**: `/health`, `/health/live`, `/health/ready`
 
 ## Quick Start
 
 ### Prerequisites
 
-- Python 3.11+
-- CloudFlare API Token with DNS edit permissions for **all zones** you want to manage
-- Kubernetes cluster access (via kubeconfig or in-cluster)
-- Services annotated with Epictetus DNS management settings
-- **Node External IPs**: Either cloud provider `ExternalIP` support OR Flannel CNI with `flannel.alpha.coreos.com/public-ip` annotations
+- Go 1.22+
+- Cloudflare API token with DNS edit permissions for all managed zones
+- Kubernetes cluster (kubeconfig or in-cluster)
 
-### Environment Setup
+### Build & Run
 
-1. **Clone the repository**:
 ```bash
-git clone <repository-url>
-cd epictetus
+# Build
+go build -o epictetus .
+
+# Run (local kubeconfig)
+export CLOUDFLARE_API_TOKEN="your-token"
+export K8S_CONFIG_PATH="$HOME/.kube/config"
+./epictetus
+
+# Run in-cluster (no K8S_CONFIG_PATH needed)
+export CLOUDFLARE_API_TOKEN="your-token"
+./epictetus
 ```
 
-2. **Install dependencies**:
+### Docker
+
 ```bash
-pip install -r requirements.txt
-```
-
-3. **Configure environment variables**:
-```bash
-# Only ONE environment variable is required now!
-export CLOUDFLARE_API_TOKEN="your-api-token"
-
-# That's it! No zone IDs needed - automatic detection
-```
-
-4. **Annotate your services** (see Service Configuration section below)
-
-5. **Run Epictetus**:
-```bash
-python main.py
+docker build -t epictetus .
+docker run -e CLOUDFLARE_API_TOKEN=your-token epictetus
 ```
 
 ## Configuration
 
-### Required Environment Variables
+All configuration is via environment variables.
 
-| Variable | Description | Example |
-|----------|-------------|---------|
-| `CLOUDFLARE_API_TOKEN` | CloudFlare API token with DNS edit permissions for **all zones** | `abc123...` |
+### Required
 
-**Note**: `CLOUDFLARE_ZONE_ID` is **no longer required** - zones are automatically detected!
+| Variable | Description |
+|----------|-------------|
+| `CLOUDFLARE_API_TOKEN` | Cloudflare API token with `Zone:DNS:Edit` for all managed zones |
 
-### Optional Environment Variables
+### Optional
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `DNS_SYNC_INTERVAL` | `60` | Full synchronization interval (seconds) |
-| `LOG_LEVEL` | `INFO` | Logging level (DEBUG, INFO, WARNING, ERROR) |
-| `LOG_FORMAT` | `console` | Log format (`console` or `json`) |
-| `HEALTH_CHECK_INTERVAL` | `30` | Health check interval (seconds) |
-| `ENABLE_HEALTH_SERVER` | `true` | Enable health check HTTP server |
-| `HEALTH_PORT` | `8080` | Port for health check server |
-| `K8S_CONFIG_PATH` | `None` | Path to kubeconfig file (leave empty for in-cluster) |
-| `MAX_RETRIES` | `3` | Maximum retries for API calls |
-| `RETRY_DELAY` | `5` | Delay between retries (seconds) |
+| `DNS_SYNC_INTERVAL` | `60` | Full sync interval in seconds (minimum 10) |
+| `WORKER_COUNT` | `4` | Number of concurrent reconciliation workers |
+| `UNHEALTHY_NODE_TAINTS` | `critical` | Taint set that triggers immediate DNS removal (see below) |
+| `REMOVE_ON_NOT_READY` | `true` | Remove DNS when node Ready=False |
+| `REMOVE_ON_UNREACHABLE` | `true` | Remove DNS when node Ready=Unknown |
+| `K8S_CONFIG_PATH` | _(in-cluster)_ | Path to kubeconfig; omit when running inside the cluster |
+| `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARN`, `ERROR` |
+| `LOG_FORMAT` | `console` | `console` (text) or `json` |
+| `HEALTH_PORT` | `8080` | Port for the health HTTP server |
+| `MAX_RETRIES` | `3` | Cloudflare API retry count |
+
+### Unhealthy Node Taints
+
+| Value | Taints monitored |
+|-------|-----------------|
+| `none` | None (only deletion taints) |
+| `critical` | `not-ready`, `unreachable`, `network-unavailable`, `out-of-service`, `cilium/agent-not-ready` |
+| `all` | Critical + `unschedulable` |
+| `custom:taint1,taint2` | Comma-separated list |
 
 ## Service Configuration
 
-DNS management is configured entirely through **Kubernetes service annotations**. No ConfigMaps or hardcoded configuration needed!
+DNS management is configured via Kubernetes service annotations.
 
 ### Required Annotations
 
-| Annotation | Description | Example |
-|------------|-------------|---------|
-| `epictetus.io/dns-enabled` | Enable DNS management for this service | `"true"` |
-| `epictetus.io/hostname` | The DNS hostname to manage | `"api.example.com"` |
+| Annotation | Description |
+|------------|-------------|
+| `epictetus.io/dns-enabled: "true"` | Enable DNS management |
+| `epictetus.io/hostname: "api.example.com"` | Single hostname (legacy) |
+| `epictetus.io/hostnames: "a.example.com,b.example.com"` | Multiple hostnames |
 
 ### Optional Annotations
 
-| Annotation | Default | Description | Example |
-|------------|---------|-------------|---------|
-| `epictetus.io/ttl` | `300` | TTL in seconds for DNS records | `"600"` |
-| `epictetus.io/proxied` | `false` | Enable CloudFlare proxy | `"true"` |
+| Annotation | Default | Description |
+|------------|---------|-------------|
+| `epictetus.io/ttl` | `300` | DNS record TTL in seconds |
+| `epictetus.io/proxied` | `false` | Enable Cloudflare proxy |
+| `epictetus.io/control-plane-only` | `false` | When `true`, only announce control-plane node IPs; worker node IPs are ignored and removed if present |
 
-### Service Configuration Examples
+### Examples
 
 ```yaml
-# Frontend service with short TTL and proxy enabled
+# Single hostname
 apiVersion: v1
 kind: Service
 metadata:
   name: frontend
-  namespace: production
   annotations:
     epictetus.io/dns-enabled: "true"
     epictetus.io/hostname: "app.example.com"
@@ -132,407 +152,88 @@ spec:
     app: frontend
   ports:
     - port: 80
-      targetPort: 8080
+```
 
----
-# API service with longer TTL and no proxy (different domain/zone)
+```yaml
+# Multiple hostnames across different Cloudflare zones
 apiVersion: v1
 kind: Service
 metadata:
   name: api
-  namespace: production
   annotations:
     epictetus.io/dns-enabled: "true"
-    epictetus.io/hostname: "api.different-domain.com"
+    epictetus.io/hostnames: '["api.example.com", "api.company.org", "api.startup.io"]'
     epictetus.io/ttl: "300"
-    epictetus.io/proxied: "false"
 spec:
   selector:
     app: api
   ports:
     - port: 443
-      targetPort: 8080
+```
 
----
-# Backend service (third domain/zone)
+```yaml
+# Control-plane nodes only — useful for internal/admin services that should
+# not be reachable via worker IPs
 apiVersion: v1
 kind: Service
 metadata:
-  name: backend
-  namespace: production
+  name: admin
   annotations:
     epictetus.io/dns-enabled: "true"
-    epictetus.io/hostname: "backend.another-domain.org"
-    epictetus.io/ttl: "600"
-    epictetus.io/proxied: "true"
+    epictetus.io/hostname: "admin.example.com"
+    epictetus.io/control-plane-only: "true"
+    epictetus.io/ttl: "300"
 spec:
   selector:
-    app: backend
+    app: admin
   ports:
-    - port: 80
-      targetPort: 3000
+    - port: 443
 ```
 
-## Multi-Zone Support
+## DNS Record Removal Triggers
 
-### Automatic Zone Detection
+### Immediate removal
+- Node `Ready=False` (configurable via `REMOVE_ON_NOT_READY`)
+- Node `Ready=Unknown` (configurable via `REMOVE_ON_UNREACHABLE`)
+- Any taint in the `UNHEALTHY_NODE_TAINTS` set
 
-Epictetus automatically:
-- 🔍 **Discovers all CloudFlare zones** in your account at startup
-- 🎯 **Maps each hostname** to the correct zone (e.g., `api.example.com` → `example.com` zone)
-- 💾 **Caches zone mappings** for performance
-- 🌐 **Manages multiple domains** simultaneously across different zones
+### Conservative removal (cluster autoscaler)
+- **Both** `DeletionCandidateOfClusterAutoscaler` AND `ToBeDeletedByClusterAutoscaler` present
 
-### Example Multi-Domain Setup
+### Node deleted
+- Immediate removal using the cached IP
 
-```yaml
-# These services can all be managed simultaneously:
-# • app.example.com        (Zone: example.com)
-# • api.company.org        (Zone: company.org)  
-# • backend.startup.io     (Zone: startup.io)
-# • frontend.mybrand.net   (Zone: mybrand.net)
-```
+## External IP Detection
 
-### Benefits
+Three-stage fallback, tried in order:
 
-- **No Zone Configuration**: No need to specify zone IDs
-- **Dynamic**: Add new domains without redeploying Epictetus
-- **Scalable**: Supports unlimited zones and domains
-- **Error Handling**: Clear errors if hostname doesn't match any zone
-
-## Health Check Endpoints
-
-When `ENABLE_HEALTH_SERVER=true`, Epictetus provides health check endpoints:
-
-- `GET /health` - Basic health check with zone information
-- `GET /health/ready` - Kubernetes readiness probe
-- `GET /health/live` - Kubernetes liveness probe
-
-### Example Health Check Response
-
-```bash
-curl http://localhost:8080/health
-```
-
-```json
-{
-  "status": "healthy",
-  "kubernetes_status": {"status": "healthy"},
-  "cloudflare_status": {
-    "status": "healthy",
-    "available_zones": 3,
-    "zones": ["example.com", "company.org", "startup.io"]
-  },
-  "dns_sync_status": {
-    "last_sync": "2024-01-15T10:30:00Z",
-    "active_service_configs": 5
-  }
-}
-```
-
-## Docker Deployment
-
-### Build and Run
-
-```bash
-# Build the image
-docker build -t epictetus .
-
-# Run with docker-compose
-docker-compose up -d
-```
-
-### Environment Variables for Docker
-
-Create a `.env` file in the project root:
-
-```bash
-# Only one variable needed!
-CLOUDFLARE_API_TOKEN=your-api-token
-```
+1. `node.status.addresses[type=ExternalIP]` — standard cloud providers (EKS, GKE, AKS)
+2. `flannel.alpha.coreos.com/public-ip` annotation — bare metal with Flannel CNI
+3. `k8s.magicorn.net/external-ip` label — manual override
 
 ## Kubernetes Deployment
 
-### Deploy to Kubernetes
-
-1. **Create namespace and secrets**:
 ```bash
 kubectl apply -f k8s/namespace.yaml
-```
-
-2. **Update secrets with your values**:
-```bash
-# Encode your CloudFlare API token
-echo -n "your-api-token" | base64
-
-# Update the secret in k8s/namespace.yaml with the encoded value
-kubectl apply -f k8s/namespace.yaml
-```
-
-3. **Deploy Epictetus**:
-```bash
 kubectl apply -f k8s/deployment.yaml
 ```
 
-4. **Annotate your services** (see Service Configuration examples above)
+Required RBAC: `get/list/watch` on `nodes` and `services`.
 
-5. **Check deployment status**:
-```bash
-kubectl get pods -n epictetus
-kubectl logs -f deployment/epictetus -n epictetus
-```
+## Health Endpoints
 
-### Kubernetes Permissions
-
-Epictetus requires the following Kubernetes RBAC permissions:
-- **Nodes**: `get`, `list`, `watch` (to monitor node taints)
-- **Services**: `get`, `list`, `watch` (to read service annotations)
-
-## How It Works
-
-### The "Poor Man's Load Balancer" Concept
-
-Traditional load balancers are expensive and complex. Epictetus provides a simpler approach:
-
-1. **DNS-based Load Balancing**: Instead of a hardware/software load balancer, uses multiple A records for the same hostname
-2. **Automatic Node Management**: As nodes join/leave the cluster, DNS records are automatically updated
-3. **Cost Effective**: Uses existing DNS infrastructure instead of dedicated load balancer resources
-4. **Cloud Native**: Integrates naturally with Kubernetes cluster autoscaling
-5. **Multi-Domain**: Supports multiple domains across different CloudFlare zones
-
-### Node Lifecycle Management
-
-**Conservative Approach - Requires BOTH Taints:**
-
-Epictetus manages DNS records throughout the complete node lifecycle:
-
-1. **Node Added**: 
-   - ✅ **DNS A records are immediately created** for all configured hostnames pointing to the node's external IP
-   - ✅ Works in real-time via Kubernetes event watching
-   - ✅ Uses service-specific settings (TTL, proxy, etc.)
-   - ✅ Skips creation only if node already has both deletion taints
-
-2. **First Taint Applied** (`DeletionCandidateOfClusterAutoscaler`):
-   - Node is identified as a candidate for deletion
-   - **Epictetus takes NO action** - waits for confirmation
-   - DNS records remain active
-
-3. **Second Taint Applied** (`ToBeDeletedByClusterAutoscaler`):
-   - Node is confirmed for deletion
-   - **Epictetus removes DNS records immediately** ⚡
-   - Conservative approach ensures only confirmed deletions trigger DNS removal
-
-4. **Node Deleted**: When a node is removed from the cluster, any remaining DNS records are cleaned up
-
-5. **Background Synchronization**:
-   - ✅ **Creates missing DNS records** for healthy nodes every minute
-   - ✅ **Removes DNS records** for IPs that no longer exist
-   - ✅ Works across all zones and domains
-   - ✅ Ensures consistency even if real-time events are missed
-
-This conservative approach ensures that DNS records are only removed when the cluster autoscaler has definitively decided to delete the node, preventing premature removal during temporary scaling decisions.
-
-### Synchronization Process
-
-- **Live Events**: Real-time processing of Kubernetes node events
-- **Scheduled Sync**: Full synchronization every minute to catch any missed events
-- **Multi-Zone Consistency**: Ensures DNS records match the current cluster state across all zones
-- **Service Discovery**: Automatically refreshes service configurations from annotations
-
-### DNS Record Management
-
-- **Multi-A Records**: Supports multiple A records per hostname (round-robin DNS)
-- **IP-based Cleanup**: Removes only records matching specific node IPs
-- **Zone-Aware Operations**: Routes DNS operations to the correct CloudFlare zone
-- **Service-Specific Settings**: Each service can have different TTL and proxy settings
-
-### External IP Detection
-
-Epictetus uses a **three-stage approach** to detect node external IP addresses:
-
-#### 1. Primary Method: Cloud Provider ExternalIP
-
-First checks the standard Kubernetes `node.status.addresses` field for `ExternalIP` type:
-- ✅ **Works with cloud providers** (AWS, GCP, Azure, etc.)
-- ✅ **Standard Kubernetes approach** 
-- ✅ **Automatic with most managed clusters**
-
-#### 2. Fallback Method: Flannel Annotation
-
-If no external IP is found in the standard field, falls back to the Flannel CNI annotation:
-- 🔧 **Annotation**: `flannel.alpha.coreos.com/public-ip`
-- 🏠 **Perfect for bare metal** and on-premise clusters
-- 🌐 **Works with Flannel CNI** deployments
-- 📝 **Debug logging** when fallback is used
-
-#### 3. Final Fallback Method: Custom Label
-
-If no external IP is found from the previous methods, checks for a custom node label:
-- 🏷️ **Label**: `k8s.magicorn.net/external-ip`
-- 🔧 **Manual Configuration**: Allows manual override of external IP
-- 🎯 **Custom Environments**: Perfect for specialized deployments
-- 📝 **Debug logging** when label is used
-
-#### Deployment Compatibility
-
-| Environment | Detection Method | Notes |
-|-------------|------------------|-------|
-| **AWS EKS** | ExternalIP field | Standard cloud provider behavior |
-| **GCP GKE** | ExternalIP field | Standard cloud provider behavior |
-| **Azure AKS** | ExternalIP field | Standard cloud provider behavior |
-| **On-Premise + Flannel** | Flannel annotation | Requires `flannel.alpha.coreos.com/public-ip` |
-| **Custom/Manual** | Custom label | Requires `k8s.magicorn.net/external-ip` label |
-| **Other CNIs** | ExternalIP field | Depends on CNI external IP support |
-
-#### Behavior
-
-- **Graceful Fallback Chain**: Tries each method in sequence until external IP is found
-- **No Configuration Needed**: Automatically detects which method to use
-- **Debug Visibility**: Logs which detection method was used
-- **Backward Compatible**: Existing deployments continue working unchanged
-
-Example log output showing detection methods:
-```
-DEBUG Using Flannel public IP annotation node_name=worker-1 external_ip=192.168.1.100
-DEBUG Using k8s.magicorn.net/external-ip label node_name=worker-2 external_ip=10.0.0.50
-DEBUG Node external IP detection node_name=worker-3 ip_source=node_status final_external_ip=203.0.113.10
-```
-
-## Monitoring
-
-### Health Checks
-
-Epictetus provides multiple health check endpoints for monitoring:
-
-- **Liveness**: `/health/live` - Simple alive check
-- **Readiness**: `/health/ready` - Checks if service is ready to serve traffic  
-- **Comprehensive**: `/health` - Detailed health information including zone status
-
-### Logging
-
-Epictetus uses structured logging with configurable formats:
-
-- **Console**: Human-readable format for development
-- **JSON**: Structured format for production log aggregation
-
-### Metrics
-
-- **Zone Discovery**: Tracks available CloudFlare zones
-- **Service Configurations**: Monitors active service annotations
-- **DNS Operations**: Logs creation, deletion, and sync operations
-- **Error Tracking**: Comprehensive error logging with context
-
-## Troubleshooting
-
-### Common Issues
-
-1. **CloudFlare API Authentication**:
-   ```bash
-   # Test your API token
-   curl -X GET "https://api.cloudflare.com/client/v4/user/tokens/verify" \
-        -H "Authorization: Bearer YOUR_API_TOKEN"
-   ```
-
-2. **Zone Detection Issues**:
-   - Check that your hostname's domain exists in CloudFlare
-   - Verify your API token has access to the zone
-   - Look for zone warnings in the logs
-
-3. **Service Annotation Format**:
-   ```bash
-   # Check service annotations
-   kubectl get service <service-name> -o yaml
-   
-   # Should include:
-   # epictetus.io/dns-enabled: "true"
-   # epictetus.io/hostname: "your-hostname.com"
-   ```
-
-4. **Kubernetes Permissions**:
-   ```bash
-   # Check service account permissions
-   kubectl auth can-i get nodes --as=system:serviceaccount:epictetus:epictetus
-   kubectl auth can-i get services --as=system:serviceaccount:epictetus:epictetus
-   ```
-
-5. **DNS Records Not Updating**:
-   - Check the logs for API errors
-   - Verify node external IPs are accessible
-   - Ensure hostnames match domains in your CloudFlare zones
-   - Confirm that **BOTH** deletion taints are present before expecting DNS removal
-
-6. **External IP Not Detected**:
-   - **Cloud Providers**: Verify your cloud provider populates the `ExternalIP` field in node status
-   - **Bare Metal/On-Premise**: Ensure Flannel is configured with the `flannel.alpha.coreos.com/public-ip` annotation
-   - **Debug**: Enable debug logging to see which detection method is being used
-   - **Check Node**: `kubectl get nodes -o wide` to see if external IPs are visible to Kubernetes
-
-### Debugging
-
-Enable debug logging:
-```bash
-export LOG_LEVEL=DEBUG
-python main.py
-```
-
-Check service status:
-```bash
-curl http://localhost:8080/health
-```
-
-View service configurations:
-```bash
-# Check which services Epictetus is managing
-kubectl get services -A -o jsonpath='{range .items[*]}{.metadata.namespace}{"/"}{.metadata.name}{"\t"}{.metadata.annotations.epictetus\.io/dns-enabled}{"\t"}{.metadata.annotations.epictetus\.io/hostname}{"\n"}{end}' | grep true
-```
+| Endpoint | Description |
+|----------|-------------|
+| `GET /health/live` | Liveness probe — always 200 if the process is running |
+| `GET /health/ready` | Readiness probe — 503 until the first full sync completes |
+| `GET /health` | Full status including Cloudflare connectivity and available zones |
 
 ## Why "Epictetus"?
 
-Epictetus was a Greek Stoic philosopher who taught that we should focus on what we can control and accept what we cannot. This philosophy aligns perfectly with this project:
+Epictetus was a Stoic philosopher who taught focusing on what you can control and accepting what you cannot. This service maintains equilibrium by responding to external events (node lifecycle) rather than fighting them — conservative on deletion, immediate on failure.
 
-- **Focus on what we can control**: DNS records, node monitoring, synchronization
-- **Accept what we cannot**: Kubernetes cluster decisions, node lifecycle events
-- **Respond appropriately**: React to changes without fighting the system
-
-Just like the philosopher, this service maintains equilibrium by responding wisely to external events rather than trying to control them. The conservative approach of requiring both taints reflects this wisdom - patience and careful observation before action.
-
-## Security
-
-### Best Practices
-
-- **Least Privilege**: Service account has minimal required permissions
-- **Secret Management**: Sensitive data stored in Kubernetes secrets
-- **Non-root User**: Container runs as non-root user
-- **Network Policies**: Recommended to implement network policies
-
-### CloudFlare API Token
-
-Create a custom API token with:
-- **Permissions**: `Zone:DNS:Edit` for all zones you want to manage
-- **Zone Resources**: Include all zones you need to manage
-- **IP Restrictions**: Optionally restrict to your cluster IPs
-
-## Contributing
-
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Add tests if applicable
-5. Submit a pull request
+*"You have power over your mind — not outside events. Realize this, and you will find strength."* — Epictetus
 
 ## License
 
-This project is licensed under the GNU General Public License v3.0 - see the [LICENSE](LICENSE) file for details.
-
-## Support
-
-For issues and questions:
-1. Check the troubleshooting section
-2. Check application logs
-3. Open an issue on GitHub
-
----
-
-**"You have power over your mind - not outside events. Realize this, and you will find strength."** - Epictetus
-
-*Epictetus: A poor man's load balancer that finds strength in simplicity and wisdom in patience.*
+GNU General Public License v3.0
