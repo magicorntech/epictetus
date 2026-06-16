@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/magicorn/epictetus/internal/cloudflare"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -26,6 +27,7 @@ type Controller struct {
 	queue        workqueue.RateLimitingInterface
 	reconciler   *Reconciler
 	store        *ServiceStore
+	cfClient     *cloudflare.Client
 	syncPeriod   time.Duration
 }
 
@@ -33,6 +35,7 @@ func New(
 	client kubernetes.Interface,
 	reconciler *Reconciler,
 	store *ServiceStore,
+	cfClient *cloudflare.Client,
 	syncPeriod time.Duration,
 ) *Controller {
 	factory := informers.NewSharedInformerFactory(client, 0)
@@ -44,6 +47,7 @@ func New(
 		queue:        workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter()),
 		reconciler:   reconciler,
 		store:        store,
+		cfClient:     cfClient,
 		syncPeriod:   syncPeriod,
 	}
 
@@ -227,6 +231,9 @@ func (c *Controller) runPeriodicSync(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			if err := c.cfClient.RefreshZones(ctx); err != nil {
+				slog.Warn("zone refresh failed", "err", err)
+			}
 			c.fullSync(ctx)
 		}
 	}

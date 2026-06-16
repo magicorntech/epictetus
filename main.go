@@ -57,7 +57,7 @@ func run() error {
 
 	store := controller.NewServiceStore()
 	reconciler := controller.NewReconciler(cfClient, store, cfg)
-	ctrl := controller.New(k8sClient, reconciler, store, time.Duration(cfg.SyncInterval)*time.Second)
+	ctrl := controller.New(k8sClient, reconciler, store, cfClient, time.Duration(cfg.SyncInterval)*time.Second)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()

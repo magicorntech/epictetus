@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	cf "github.com/cloudflare/cloudflare-go"
@@ -21,11 +22,13 @@ type Record struct {
 }
 
 type Client struct {
-	api           *cf.API
-	mu            sync.RWMutex
-	zones         map[string]string // zone name -> zone ID
-	hostnameZones sync.Map          // hostname -> zone ID
-	sema          chan struct{}      // concurrency limiter for CF API calls
+	api             *cf.API
+	mu              sync.RWMutex
+	zones           map[string]string // zone name -> zone ID
+	hostnameZones   sync.Map          // hostname -> zone ID
+	sema            chan struct{}      // concurrency limiter for CF API calls
+	lastRefreshAt   atomic.Int64      // unix nano of last successful zone refresh
+	lastRefreshErr  atomic.Pointer[error]
 }
 
 func NewClient(token string, maxConcurrency int) (*Client, error) {
@@ -101,6 +104,8 @@ func (c *Client) refreshZones(ctx context.Context) error {
 		return true
 	})
 
+	c.lastRefreshAt.Store(time.Now().UnixNano())
+	c.lastRefreshErr.Store(nil)
 	slog.Debug("refreshed cloudflare zones", "count", len(zones))
 	return nil
 }
@@ -194,8 +199,22 @@ func (c *Client) DeleteRecord(ctx context.Context, recordID, zoneID string) erro
 	})
 }
 
-// HealthCheck validates Cloudflare connectivity by refreshing the zone list.
-func (c *Client) HealthCheck(ctx context.Context) error {
+// HealthCheck reports Cloudflare connectivity based on the last zone refresh
+// rather than making a live API call. This avoids 503s from transient CF
+// slowness and prevents cache-clearing on every probe.
+func (c *Client) HealthCheck(_ context.Context) error {
+	if errPtr := c.lastRefreshErr.Load(); errPtr != nil {
+		return *errPtr
+	}
+	if c.lastRefreshAt.Load() == 0 {
+		return fmt.Errorf("zone list not yet loaded")
+	}
+	return nil
+}
+
+// RefreshZones re-fetches all Cloudflare zones and updates the zone cache.
+// Call this periodically rather than on every health probe.
+func (c *Client) RefreshZones(ctx context.Context) error {
 	return c.refreshZones(ctx)
 }
 
